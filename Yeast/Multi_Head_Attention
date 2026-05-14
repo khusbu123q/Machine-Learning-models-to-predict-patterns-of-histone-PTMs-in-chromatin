@@ -1,0 +1,121 @@
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+
+class CrossAttentionModel(nn.Module):
+    def __init__(self, input_dim=1, hidden_dim=32, num_heads=4):
+        super().__init__()
+
+        self.embed = nn.Linear(input_dim, hidden_dim)
+
+        self.attn = nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=num_heads,
+            batch_first=True
+        )
+
+        self.fc = nn.Linear(hidden_dim, 1)
+
+    def forward(self, x_pos, x_target):
+        key_val = torch.relu(self.embed(x_pos))      # (batch, 5, hidden)
+        query   = torch.relu(self.embed(x_target))   # (batch, 1, hidden)
+
+        attn_output, attn_weights = self.attn(query, key_val, key_val)
+
+        out = self.fc(attn_output.squeeze(1))
+
+        return out, attn_weights
+
+df = pd.read_csv('/Users/khusbuagarwal/Downloads/yeast_db.csv')
+
+df = df.iloc[1:].copy()
+df['gene_pos'] = pd.to_numeric(df['gene_pos'], errors='coerce')
+df = df.dropna(subset=['gene_pos'])
+
+timestamps = ['', '1', '2', '3', '4', '5']
+ptm_list = ['H3K4me3']
+
+results = []
+
+for ptm in ptm_list:
+    for t in timestamps:
+
+        time_label = 0 if t == '' else int(t)
+        col_name = ptm if t == '' else f"{ptm}.{t}"
+
+        if col_name not in df.columns:
+            continue
+
+        subset = df[['gene','gene_pos',col_name]]
+
+        pivot = subset.pivot_table(
+            index='gene',
+            columns='gene_pos',
+            values=col_name
+        )
+
+        needed_positions = [-1,1,2,3,4,5]
+        for pos in needed_positions:
+            if pos not in pivot.columns:
+                pivot[pos] = 0
+
+        pivot = pivot[needed_positions]
+
+        pivot = pivot.dropna(subset=[-1])
+        pivot[[1,2,3,4,5]] = pivot[[1,2,3,4,5]].fillna(0)
+
+        if len(pivot) == 0:
+            continue
+
+
+        X_pos = torch.from_numpy(
+            pivot[[1,2,3,4,5]].values.astype(np.float32)
+        ).unsqueeze(-1)   # (batch, 5, 1)
+
+        X_target = torch.from_numpy(
+            pivot[[-1]].values.astype(np.float32)
+        ).unsqueeze(1)    # (batch, 1, 1)
+
+        y = X_target.squeeze(1).clone().detach()
+
+        model = CrossAttentionModel()
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+        loss_fn = nn.MSELoss()
+
+        model.train()
+        for epoch in range(50):
+            optimizer.zero_grad()
+
+            pred, attn = model(X_pos, X_target)
+            loss = loss_fn(pred, y)
+
+            loss.backward()
+            optimizer.step()
+
+        model.eval()
+        with torch.no_grad():
+            _, attn = model(X_pos, X_target)
+
+            # (batch, heads, 1, 5) → (batch, 5)
+            attn = attn.mean(dim=1).squeeze(1).cpu().numpy()
+        for i, gene in enumerate(pivot.index):
+            results.append({
+                "PTM": ptm,
+                "Timepoint": time_label,
+                "Gene": gene,
+                "Pos+1": attn[i, 0],
+                "Pos+2": attn[i, 1],
+                "Pos+3": attn[i, 2],
+                "Pos+4": attn[i, 3],
+                "Pos+5": attn[i, 4]
+            })
+
+        print(f"{ptm} | time {time_label} | DONE")
+
+
+
+results_df = pd.DataFrame(results)
+save_path = "/Users/khusbuagarwal/Downloads/PTM_CrossAttention_ONLY.xlsx"
+results_df.to_excel(save_path, index=False)
+print("Saved:", save_path)
