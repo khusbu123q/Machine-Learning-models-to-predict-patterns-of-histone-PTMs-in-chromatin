@@ -143,16 +143,8 @@ for ptm in unique_ptms:
         continue
 
 # FINAL RESULTS
-
-
 results_df = pd.DataFrame(results)
-
 results_df = results_df.sort_values(by="Mean_R2", ascending=False)
-
-print("\n================ BEST RESULTS ================\n")
-
 print(results_df.head(20))
-
 results_df.to_csv("PTM_plus1_prediction_results.csv", index=False)
-
 print("\nResults saved to PTM_plus1_prediction_results.csv")
