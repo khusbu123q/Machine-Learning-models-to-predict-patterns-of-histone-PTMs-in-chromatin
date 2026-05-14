@@ -1,0 +1,132 @@
+import pandas as pd
+import numpy as np
+from sklearn.linear_model import LinearRegression
+from sklearn.svm import SVR
+from sklearn.ensemble import RandomForestRegressor
+from xgboost import XGBRegressor
+from sklearn.model_selection import KFold, cross_val_score
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+
+# LOAD DATA
+df = pd.read_csv('/Users/khusbuagarwal/Downloads/yeast_db.csv')
+time_row = df.iloc[0]
+data = df.iloc[1:].copy()
+data['gene_pos'] = pd.to_numeric(data['gene_pos'], errors='coerce')
+
+# IDENTIFY ALL PTM COLUMNS AND THEIR TIMEPOINTS
+start_index = df.columns.get_loc("gene_pos") + 1
+ptm_time_map = {}  # { timepoint_value: [col1, col2, ...] }
+
+for col in df.columns[start_index:]:
+    if col.lower().startswith("input"):
+        continue
+    try:
+        t = float(time_row[col])
+        ptm_time_map.setdefault(t, []).append(col)
+    except:
+        pass
+
+all_timepoints = sorted(ptm_time_map.keys())
+print(f"Timepoints found: {all_timepoints}")
+
+# NUCLEOSOME POSITIONS
+positions = [-3, -2, -1, 1, 2, 3]
+feature_positions = [-3, -2, -1, 2, 3]   # everything except +1 (target)
+target_position = 1
+
+kf = KFold(n_splits=5, shuffle=True, random_state=42)
+
+all_results = []
+
+# LOOP OVER EVERY TIMEPOINT
+for timepoint in all_timepoints:
+    ptm_cols = ptm_time_map[timepoint]
+    print(f"\n{'='*60}")
+    print(f"TIMEPOINT: {timepoint}  |  PTMs available: {len(ptm_cols)}")
+    print(f"{'='*60}")
+
+    # Build subset for this timepoint
+    subset = data[data['gene_pos'].isin(positions)][['gene', 'gene_pos'] + ptm_cols].copy()
+    pivot_df = subset.pivot_table(index='gene', columns='gene_pos', values=ptm_cols)
+
+    # pivot_table with multiple values gives a MultiIndex: (ptm_col, gene_pos)
+    unique_ptms = pivot_df.columns.get_level_values(0).unique()
+
+    for ptm in unique_ptms:
+        try:
+            ptm_df = pivot_df[ptm].copy()
+
+            # Ensure target and all feature positions exist
+            if target_position not in ptm_df.columns:
+                continue
+            if not all(pos in ptm_df.columns for pos in feature_positions):
+                continue
+
+            ptm_df = ptm_df[[target_position] + feature_positions]
+
+            # Drop genes missing target; fill missing features with 0
+            ptm_df = ptm_df.dropna(subset=[target_position])
+            ptm_df[feature_positions] = ptm_df[feature_positions].fillna(0)
+
+            genes_count = len(ptm_df)
+            if genes_count < 10:      # skip PTMs with too few samples
+                continue
+
+            X = ptm_df[feature_positions].values
+            y = ptm_df[target_position].values
+
+            # MODELS
+            models = {
+                "LinearRegression": Pipeline([
+                    ('scaler', StandardScaler()),
+                    ('lr', LinearRegression())
+                ]),
+                "SVM": Pipeline([
+                    ('scaler', StandardScaler()),
+                    ('svm', SVR(kernel='rbf'))
+                ]),
+                "RandomForest": RandomForestRegressor(
+                    n_estimators=200,
+                    random_state=42,
+                    n_jobs=-1
+                ),
+                "XGBoost": XGBRegressor(
+                    n_estimators=200,
+                    learning_rate=0.05,
+                    max_depth=4,
+                    random_state=42,
+                    verbosity=0
+                )
+            }
+
+            print(f"\n  PTM: {ptm}  |  Genes: {genes_count}")
+            for model_name, model in models.items():
+                scores = cross_val_score(model, X, y, cv=kf, scoring='r2')
+                mean_r2 = np.mean(scores)
+                std_r2  = np.std(scores)
+                print(f"    {model_name:20s}  Mean R2: {mean_r2:.4f}  ±{std_r2:.4f}")
+                all_results.append({
+                    "Timepoint":  timepoint,
+                    "PTM":        ptm,
+                    "Model":      model_name,
+                    "Genes":      genes_count,
+                    "Mean_R2":    mean_r2,
+                    "Std_R2":     std_r2
+                })
+
+        except Exception as e:
+            print(f"    Skipping PTM {ptm}: {e}")
+            continue
+
+# FINAL RESULTS
+results_df = pd.DataFrame(all_results)
+results_df = results_df.sort_values(by=["Timepoint", "Mean_R2"], ascending=[True, False])
+
+output_path = "PTM_plus1_prediction_all_timepoints.csv"
+results_df.to_csv(output_path, index=False)
+print(f"\n\nResults saved to {output_path}")
+print(f"Total rows: {len(results_df)}")
+print("\n--- BEST MODEL PER TIMEPOINT (by Mean R2) ---")
+best = results_df.loc[results_df.groupby("Timepoint")["Mean_R2"].idxmax()]
+print(best[["Timepoint", "PTM", "Model", "Genes", "Mean_R2"]].to_string(index=False))
