@@ -1,0 +1,153 @@
+import pandas as pd
+import numpy as np
+import joblib
+import os
+from sklearn.model_selection import train_test_split, cross_val_score, RandomizedSearchCV
+from sklearn.linear_model import Ridge
+from sklearn.svm import SVR
+from sklearn.ensemble import RandomForestRegressor
+from xgboost import XGBRegressor
+from sklearn.metrics import mean_squared_error, r2_score
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+
+df = pd.read_csv("/Users/khusbuagarwal/final_results_all.tsv", sep="\t")  # ← replace filename
+
+wide = df.pivot_table(index="gene_id", columns="label", values="avg_score")
+
+TARGET_LABEL   = -1
+FEATURE_LABELS = [l for l in range(1, 50) if l in wide.columns]
+
+y_raw = wide[TARGET_LABEL].fillna(0.0)
+X_raw = wide[FEATURE_LABELS].fillna(0.0)
+
+mask  = y_raw > 0
+X = np.log1p(X_raw[mask])
+y = np.log1p(y_raw[mask])
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42
+)
+print(f"Train: {len(X_train)} | Test: {len(X_test)} | Features: {X.shape[1]}\n")
+
+os.makedirs("saved_models", exist_ok=True)
+results = []
+
+def evaluate(name, pipeline, X_tr, y_tr, X_te, y_te, X_full, y_full):
+    pipeline.fit(X_tr, y_tr)
+    preds = pipeline.predict(X_te)
+    mse   = mean_squared_error(y_te, preds)
+    rmse  = np.sqrt(mse)
+    r2    = r2_score(y_te, preds)
+    cv_r2 = cross_val_score(pipeline, X_full, y_full,
+                            cv=5, scoring="r2", n_jobs=-1).mean()
+    print(f"  MSE={mse:.4f}  RMSE={rmse:.4f}  R²={r2:.4f}  CV R²={cv_r2:.4f}")
+    results.append({"Model": name, "MSE": round(mse,4), "RMSE": round(rmse,4),
+                    "R2": round(r2,4), "CV_R2": round(cv_r2,4)})
+    joblib.dump(pipeline, f"saved_models/{name}.pkl")
+    return r2
+
+scaler = StandardScaler()
+X_train_sc = scaler.fit_transform(X_train)
+X_test_sc  = scaler.transform(X_test)
+X_sc       = scaler.transform(X)
+
+
+print(" Ridge (RandomizedSearch)...")
+ridge_params = {"alpha": np.logspace(-3, 4, 200)}
+ridge_search = RandomizedSearchCV(
+    Ridge(), ridge_params, n_iter=30, cv=5,
+    scoring="r2", n_jobs=-1, random_state=42
+)
+ridge_search.fit(X_train_sc, y_train)
+best_alpha = ridge_search.best_params_["alpha"]
+print(f"  Best alpha={best_alpha:.4f}")
+ridge_pipe = Pipeline([("scaler", StandardScaler()), ("model", Ridge(alpha=best_alpha))])
+evaluate("Ridge_tuned", ridge_pipe, X_train, y_train, X_test, y_test, X, y)
+
+print("\n  SVM (RandomizedSearch)...")
+svm_params = {
+    "C":       [0.1, 1, 10, 50, 100, 200, 500],
+    "epsilon": [0.001, 0.01, 0.05, 0.1, 0.2],
+    "gamma":   ["scale", "auto", 0.001, 0.01, 0.1]
+}
+svm_search = RandomizedSearchCV(
+    SVR(kernel="rbf"), svm_params, n_iter=30, cv=5,
+    scoring="r2", n_jobs=-1, random_state=42
+)
+svm_search.fit(X_train_sc, y_train)
+bp = svm_search.best_params_
+print(f"  Best C={bp['C']}  epsilon={bp['epsilon']}  gamma={bp['gamma']}")
+svm_pipe = Pipeline([("scaler", StandardScaler()),
+                     ("model", SVR(kernel="rbf", C=bp["C"],
+                                  epsilon=bp["epsilon"], gamma=bp["gamma"]))])
+evaluate("SVM_tuned", svm_pipe, X_train, y_train, X_test, y_test, X, y)
+
+print("\n Random Forest (RandomizedSearch)...")
+rf_params = {
+    "n_estimators":    [300, 500, 700, 1000],
+    "max_depth":       [10, 15, 20, 25, None],
+    "min_samples_leaf":[1, 2, 3, 5],
+    "max_features":    [0.4, 0.5, 0.6, 0.7, 0.8, "sqrt"]
+}
+rf_search = RandomizedSearchCV(
+    RandomForestRegressor(n_jobs=-1, random_state=42),
+    rf_params, n_iter=30, cv=5,
+    scoring="r2", n_jobs=-1, random_state=42
+)
+rf_search.fit(X_train_sc, y_train)
+bp = rf_search.best_params_
+print(f"  Best: {bp}")
+rf_pipe = Pipeline([("scaler", StandardScaler()),
+                    ("model", RandomForestRegressor(
+                        n_estimators=bp["n_estimators"],
+                        max_depth=bp["max_depth"],
+                        min_samples_leaf=bp["min_samples_leaf"],
+                        max_features=bp["max_features"],
+                        n_jobs=-1, random_state=42))])
+evaluate("RandomForest_tuned", rf_pipe, X_train, y_train, X_test, y_test, X, y)
+
+print("\n XGBoost (RandomizedSearch)...")
+xgb_params = {
+    "n_estimators":     [300, 500, 700, 1000],
+    "learning_rate":    [0.01, 0.02, 0.03, 0.05, 0.1],
+    "max_depth":        [3, 4, 5, 6, 8],
+    "subsample":        [0.6, 0.7, 0.8, 0.9, 1.0],
+    "colsample_bytree": [0.5, 0.6, 0.7, 0.8, 1.0],
+    "reg_alpha":        [0, 0.01, 0.05, 0.1, 0.5],
+    "reg_lambda":       [0.5, 1.0, 2.0, 5.0]
+}
+xgb_search = RandomizedSearchCV(
+    XGBRegressor(n_jobs=-1, random_state=42, verbosity=0),
+    xgb_params, n_iter=30, cv=5,
+    scoring="r2", n_jobs=-1, random_state=42
+)
+xgb_search.fit(X_train_sc, y_train)
+bp = xgb_search.best_params_
+print(f"  Best: {bp}")
+xgb_pipe = Pipeline([("scaler", StandardScaler()),
+                     ("model", XGBRegressor(
+                         n_estimators=bp["n_estimators"],
+                         learning_rate=bp["learning_rate"],
+                         max_depth=bp["max_depth"],
+                         subsample=bp["subsample"],
+                         colsample_bytree=bp["colsample_bytree"],
+                         reg_alpha=bp["reg_alpha"],
+                         reg_lambda=bp["reg_lambda"],
+                         n_jobs=-1, random_state=42, verbosity=0))])
+evaluate("XGBoost_tuned", xgb_pipe, X_train, y_train, X_test, y_test, X, y)
+
+
+print("\n" + "=" * 62)
+print(f"{'Model':<25} {'R²':>8} {'CV R²':>10}")
+print("=" * 62)
+results_df = pd.DataFrame(results).sort_values("R2", ascending=False)
+for _, row in results_df.iterrows():
+    print(f"{row['Model']:<25} {row['R2']:>8.4f} {row['CV_R2']:>10.4f}")
+print("=" * 62)
+
+results_df.to_csv("tuning_results.csv", index=False)
+best = results_df.iloc[0]
+print(f"\n Best tuned model : {best['Model']}  (R² = {best['R2']})")
+print("Tuned models saved to : saved_models/")
+print("Results saved to      : tuning_results.csv")
