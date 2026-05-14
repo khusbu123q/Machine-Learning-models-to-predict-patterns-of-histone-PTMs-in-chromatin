@@ -1,0 +1,267 @@
+import os
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.model_selection import train_test_split, KFold
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_squared_error, r2_score
+
+SEED = 42
+torch.manual_seed(SEED)
+np.random.seed(SEED)
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Device: {DEVICE}\n")
+
+df = pd.read_csv("/Users/khusbuagarwal/final_results_all.tsv", sep="\t")
+wide = df.pivot_table(index="gene_id", columns="label", values="avg_score")
+
+TARGET_LABEL   = -1
+FEATURE_LABELS = [l for l in range(1, 50) if l in wide.columns]
+
+y_raw = wide[TARGET_LABEL].fillna(0.0)
+X_raw = wide[FEATURE_LABELS].fillna(0.0)
+
+mask = y_raw > 0
+X_np = np.log1p(X_raw[mask].values).astype(np.float32)
+y_np = np.log1p(y_raw[mask].values).astype(np.float32)
+
+X_train_np, X_test_np, y_train_np, y_test_np = train_test_split(
+    X_np, y_np, test_size=0.2, random_state=SEED
+)
+
+scaler = StandardScaler()
+X_train_sc = scaler.fit_transform(X_train_np).astype(np.float32)
+X_test_sc  = scaler.transform(X_test_np).astype(np.float32)
+X_all_sc   = scaler.transform(X_np).astype(np.float32)
+
+N_FEATURES = X_train_sc.shape[1]
+print(f"Train: {len(X_train_sc)} | Test: {len(X_test_sc)} | Features: {N_FEATURES}\n")
+
+os.makedirs("saved_models", exist_ok=True)
+dl_results = []
+
+
+def to_tensors(X, y):
+    return (torch.tensor(X, dtype=torch.float32),
+            torch.tensor(y, dtype=torch.float32).unsqueeze(1))
+
+
+def make_loader(X, y, batch_size=64, shuffle=True):
+    ds = TensorDataset(*to_tensors(X, y))
+    return DataLoader(ds, batch_size=batch_size, shuffle=shuffle)
+
+
+class FFN(nn.Module):
+    def __init__(self, in_features: int, hidden: list[int] = [256, 128, 64],
+                 dropout: float = 0.3):
+        super().__init__()
+        layers = []
+        prev = in_features
+        for h in hidden:
+            layers += [
+                nn.Linear(prev, h),
+                nn.BatchNorm1d(h),
+                nn.GELU(),
+                nn.Dropout(dropout),
+            ]
+            prev = h
+        self.body = nn.Sequential(*layers)
+        self.head = nn.Linear(prev, 1)
+        self.skip = (nn.Linear(in_features, hidden[-1])
+                     if in_features != hidden[-1] else nn.Identity())
+
+    def forward(self, x):
+        out = x
+        for i, layer in enumerate(self.body):
+            out = layer(out)
+            if i == len(self.body) - 1:
+                out = out + self.skip(x)
+        return self.head(out)
+
+
+class CNN1D(nn.Module):
+    def __init__(self, in_features: int, channels: list[int] = [64, 128, 64],
+                 dropout: float = 0.3):
+        super().__init__()
+        self.conv_blocks = nn.ModuleList()
+        prev_c = 1
+        for c in channels:
+            block = nn.Sequential(
+                nn.Conv1d(prev_c, c, kernel_size=3, padding=1),
+                nn.BatchNorm1d(c),
+                nn.GELU(),
+                nn.Dropout(dropout),
+            )
+            self.conv_blocks.append(block)
+            prev_c = c
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        self.head = nn.Linear(channels[-1], 1)
+
+    def forward(self, x):
+        out = x.unsqueeze(1)
+        for block in self.conv_blocks:
+            out = block(out)
+        out = self.pool(out).squeeze(-1)
+        return self.head(out)
+
+
+def train_model(model, train_loader, val_loader,
+                epochs: int = 150, patience: int = 20,
+                lr: float = 1e-3, weight_decay: float = 1e-4):
+    model.to(DEVICE)
+    optimiser = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimiser, T_max=epochs, eta_min=lr * 0.01
+    )
+    criterion = nn.MSELoss()
+
+    best_val_loss = float("inf")
+    best_state    = None
+    no_improve    = 0
+
+    for epoch in range(1, epochs + 1):
+        model.train()
+        train_loss = 0.0
+        for Xb, yb in train_loader:
+            Xb, yb = Xb.to(DEVICE), yb.to(DEVICE)
+            optimiser.zero_grad()
+            loss = criterion(model(Xb), yb)
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimiser.step()
+            train_loss += loss.item() * len(Xb)
+
+        scheduler.step()
+        train_loss /= len(train_loader.dataset)
+
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for Xb, yb in val_loader:
+                Xb, yb = Xb.to(DEVICE), yb.to(DEVICE)
+                val_loss += criterion(model(Xb), yb).item() * len(Xb)
+        val_loss /= len(val_loader.dataset)
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_state    = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            no_improve    = 0
+        else:
+            no_improve += 1
+
+        if epoch % 25 == 0 or epoch == 1:
+            print(f"  Epoch {epoch:>3}/{epochs}  "
+                  f"train={train_loss:.4f}  val={val_loss:.4f}  "
+                  f"lr={scheduler.get_last_lr()[0]:.2e}")
+
+        if no_improve >= patience:
+            print(f"  Early stop at epoch {epoch}")
+            break
+
+    model.load_state_dict(best_state)
+    return model
+
+
+def predict_np(model, X_sc: np.ndarray) -> np.ndarray:
+    model.eval()
+    t = torch.tensor(X_sc, dtype=torch.float32).to(DEVICE)
+    with torch.no_grad():
+        return model(t).cpu().numpy().ravel()
+
+
+def cross_val_r2(model_cls, model_kwargs, X_sc, y_np, k: int = 5, **train_kwargs) -> float:
+    kf  = KFold(n_splits=k, shuffle=True, random_state=SEED)
+    r2s = []
+    for tr, va in kf.split(X_sc):
+        m = model_cls(**model_kwargs).to(DEVICE)
+        tr_loader = make_loader(X_sc[tr], y_np[tr])
+        va_loader = make_loader(X_sc[va], y_np[va], shuffle=False)
+        m = train_model(m, tr_loader, va_loader, **train_kwargs)
+        r2s.append(r2_score(y_np[va], predict_np(m, X_sc[va])))
+    return float(np.mean(r2s))
+
+
+def evaluate_dl(name, model, model_cls, model_kwargs,
+                X_tr_sc, y_tr, X_te_sc, y_te, X_all_sc, y_all, **train_kwargs):
+    preds = predict_np(model, X_te_sc)
+    mse   = mean_squared_error(y_te, preds)
+    rmse  = np.sqrt(mse)
+    r2    = r2_score(y_te, preds)
+
+    print(f"  Test  MSE={mse:.4f}  RMSE={rmse:.4f}  R2={r2:.4f}")
+    print("  Running 5-fold CV...")
+    cv_r2 = cross_val_r2(model_cls, model_kwargs, X_all_sc, y_all, **train_kwargs)
+    print(f"  CV R2={cv_r2:.4f}")
+
+    torch.save(model.state_dict(), f"saved_models/{name}.pt")
+    dl_results.append({
+        "Model": name,
+        "MSE":   round(mse,   4),
+        "RMSE":  round(rmse,  4),
+        "R2":    round(r2,    4),
+        "CV_R2": round(cv_r2, 4)
+    })
+
+
+FFN_KWARGS   = dict(in_features=N_FEATURES, hidden=[256, 128, 64], dropout=0.3)
+TRAIN_KWARGS = dict(epochs=200, patience=25, lr=1e-3, weight_decay=1e-4)
+
+print("=" * 62)
+print("FFN (Feed-Forward Network)")
+print("=" * 62)
+
+ffn_model = FFN(**FFN_KWARGS)
+ffn_model = train_model(ffn_model,
+                        make_loader(X_train_sc, y_train_np),
+                        make_loader(X_test_sc, y_test_np, shuffle=False),
+                        **TRAIN_KWARGS)
+evaluate_dl("FFN", ffn_model, FFN, FFN_KWARGS,
+            X_train_sc, y_train_np, X_test_sc, y_test_np,
+            X_all_sc, y_np, **TRAIN_KWARGS)
+
+CNN_KWARGS = dict(in_features=N_FEATURES, channels=[64, 128, 64], dropout=0.3)
+
+print("\n" + "=" * 62)
+print("CNN1D (1-D Convolutional Network)")
+print("=" * 62)
+
+cnn_model = CNN1D(**CNN_KWARGS)
+cnn_model = train_model(cnn_model,
+                        make_loader(X_train_sc, y_train_np),
+                        make_loader(X_test_sc, y_test_np, shuffle=False),
+                        **TRAIN_KWARGS)
+evaluate_dl("CNN1D", cnn_model, CNN1D, CNN_KWARGS,
+            X_train_sc, y_train_np, X_test_sc, y_test_np,
+            X_all_sc, y_np, **TRAIN_KWARGS)
+
+print("\n" + "=" * 62)
+print(f"{'Model':<20} {'MSE':>8} {'RMSE':>8} {'R2':>8} {'CV R2':>10}")
+print("=" * 62)
+
+dl_df = pd.DataFrame(dl_results).sort_values("R2", ascending=False)
+for _, row in dl_df.iterrows():
+    print(f"{row['Model']:<20} {row['MSE']:>8.4f} {row['RMSE']:>8.4f} "
+          f"{row['R2']:>8.4f} {row['CV_R2']:>10.4f}")
+
+if os.path.exists("tuning_results.csv"):
+    sk_df    = pd.read_csv("tuning_results.csv")
+    combined = pd.concat([sk_df, dl_df], ignore_index=True).sort_values("R2", ascending=False)
+    combined.to_csv("all_results.csv", index=False)
+    print("\nFull comparison saved to: all_results.csv")
+    print("\n" + "=" * 62)
+    print(f"{'Model':<25} {'R2':>8} {'CV R2':>10}")
+    print("=" * 62)
+    for _, row in combined.iterrows():
+        print(f"{row['Model']:<25} {row['R2']:>8.4f} {row['CV_R2']:>10.4f}")
+    best = combined.iloc[0]
+    print("=" * 62)
+    print(f"\nBest overall model: {best['Model']}  (R2 = {best['R2']})")
+else:
+    dl_df.to_csv("dl_results.csv", index=False)
+    best = dl_df.iloc[0]
+    print("\nDL results saved to: dl_results.csv")
+    print(f"\nBest DL model: {best['Model']}  (R2 = {best['R2']})")
+
+print("Model weights saved to: saved_models/FFN.pt  &  CNN1D.pt")
