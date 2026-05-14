@@ -1,1 +1,319 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import time
 
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import r2_score, mean_squared_error
+
+
+TIMEPOINTS        = {'T0': '', 'T1': '1', 'T2': '2', 'T3': '3', 'T4': '4', 'T5': '5'}
+TARGET_POS        = 1                        # predicting +1
+FEATURE_POSITIONS = [-1, -2, -3, 2, 3]      # input: -1, -2, -3, +2, +3
+
+EPOCHS     = 200
+PATIENCE   = 20
+BATCH_SIZE = 32
+LR         = 3e-3
+DEVICE     = torch.device('cpu')
+
+ptm_list = [
+    'H2AK5ac',  'H2AS129ph', 'H3K14ac',  'H3K18ac',  'H3K23ac',
+    'H3K27ac',  'H3K36me',   'H3K36me2', 'H3K36me3', 'H3K4ac',
+    'H3K4me',   'H3K4me2',   'H3K4me3',  'H3K56ac',  'H3K79me',
+    'H3K79me3', 'H3K9ac',    'H3S10ph',  'H4K12ac',  'H4K16ac',
+    'H4K20me',  'H4K5ac',    'H4K8ac',   'H4R3me',   'H4R3me2s',
+    'Htz1'
+]
+
+CSV_OUT = '/Users/khusbuagarwal/Downloads/DL_pos1_results.csv'
+
+print(f"Device     : {DEVICE}")
+print(f"PTMs       : {len(ptm_list)}")
+print(f"Timepoints : separate R² and RMSE per timepoint")
+print(f"Target     : +{TARGET_POS}  |  Features : {FEATURE_POSITIONS}")
+print(f"Epochs     : {EPOCHS}  |  Patience : {PATIENCE}\n")
+
+
+df = pd.read_csv('/Users/khusbuagarwal/Downloads/yeast_db.csv')
+df = df.iloc[1:].copy()
+df['gene_pos'] = pd.to_numeric(df['gene_pos'], errors='coerce')
+df = df.dropna(subset=['gene_pos'])
+
+cols = pd.Series(df.columns)
+for dup in cols[cols.duplicated()].unique():
+    idx = cols[cols == dup].index.tolist()
+    cols[idx] = [dup if i == 0 else f"{dup}_{i}" for i in range(len(idx))]
+df.columns = cols
+
+F = len(FEATURE_POSITIONS)
+
+# MODELS
+
+class FFN(nn.Module):
+    def __init__(self, f):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(f, 64), nn.ReLU(), nn.Dropout(0.2),
+            nn.Linear(64, 32), nn.ReLU(),
+            nn.Linear(32, 1)
+        )
+    def forward(self, x): return self.net(x)
+
+
+class CNN1D(nn.Module):
+    def __init__(self, f):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv1d(1, 16, kernel_size=3, padding=1), nn.ReLU(),
+            nn.Conv1d(16, 32, kernel_size=3, padding=1), nn.ReLU(),
+        )
+        self.fc = nn.Sequential(
+            nn.Linear(32 * f, 32), nn.ReLU(),
+            nn.Linear(32, 1)
+        )
+    def forward(self, x):
+        x = self.conv(x.unsqueeze(1))
+        return self.fc(x.flatten(1))
+
+
+class TransformerRegressor(nn.Module):
+    def __init__(self, f, d_model=32, nhead=4):
+        super().__init__()
+        self.embed   = nn.Linear(1, d_model)
+        self.pos_emb = nn.Embedding(f, d_model)
+        enc = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=nhead,
+            dim_feedforward=64, dropout=0.1,
+            batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(enc, num_layers=1)
+        self.head = nn.Linear(d_model * f, 1)
+
+    def forward(self, x):
+        t = self.embed(x.unsqueeze(2))
+        t = t + self.pos_emb(torch.arange(x.shape[1], device=x.device))
+        return self.head(self.transformer(t).flatten(1))
+
+# TRAINING WITH EARLY STOPPING
+
+def train_model(model, loader, X_te, y_te_np, epochs, patience, lr):
+    opt     = torch.optim.Adam(model.parameters(), lr=lr)
+    loss_fn = nn.MSELoss()
+    best_r2, best_preds, no_improve = -np.inf, None, 0
+
+    for ep in range(1, epochs + 1):
+        model.train()
+        for xb, yb in loader:
+            opt.zero_grad()
+            loss_fn(model(xb), yb).backward()
+            opt.step()
+
+        model.eval()
+        with torch.no_grad():
+            preds = model(X_te).cpu().numpy().flatten()
+
+        r2 = r2_score(y_te_np, preds)
+        if r2 > best_r2:
+            best_r2, best_preds, no_improve = r2, preds.copy(), 0
+        else:
+            no_improve += 1
+        if no_improve >= patience:
+            break
+
+    return best_preds, best_r2
+
+summary_results = {}
+all_plot_data   = []
+csv_rows        = []
+
+total_start  = time.time()
+total_combos = len(ptm_list) * len(TIMEPOINTS)
+combo_idx    = 0
+
+for ptm in ptm_list:
+    summary_results[ptm] = {}
+
+    for tp_label, tp_val in TIMEPOINTS.items():
+        combo_idx += 1
+        col_name = ptm if tp_val == '' else f"{ptm}.{tp_val}"
+
+        if col_name not in df.columns:
+            print(f"[{combo_idx:>3}/{total_combos}] SKIP  {ptm} {tp_label} — column missing")
+            continue
+
+        subset = df[['gene', 'gene_pos', col_name]].dropna()
+        pivot  = subset.pivot_table(index='gene', columns='gene_pos', values=col_name)
+
+        for pos in FEATURE_POSITIONS:
+            if pos not in pivot.columns:
+                pivot[pos] = 0
+
+        if TARGET_POS not in pivot.columns:
+            print(f"[{combo_idx:>3}/{total_combos}] SKIP  {ptm} {tp_label} — target missing")
+            continue
+
+        pivot = pivot[[TARGET_POS] + FEATURE_POSITIONS]
+        pivot = pivot.dropna(subset=[TARGET_POS])
+        pivot[FEATURE_POSITIONS] = pivot[FEATURE_POSITIONS].fillna(0)
+
+        if len(pivot) < 40:
+            print(f"[{combo_idx:>3}/{total_combos}] SKIP  {ptm} {tp_label} — only {len(pivot)} samples")
+            continue
+
+        X = pivot[FEATURE_POSITIONS].values.astype(np.float32)
+        y = pivot[TARGET_POS].values.astype(np.float32)
+
+        scaler   = StandardScaler()
+        X_scaled = scaler.fit_transform(X).astype(np.float32)
+
+        X_train, X_test, y_train, y_test = train_test_split(
+            X_scaled, y, test_size=0.2, random_state=42
+        )
+
+        X_tr = torch.tensor(X_train)
+        y_tr = torch.tensor(y_train).unsqueeze(1)
+        X_te = torch.tensor(X_test)
+
+        loader = DataLoader(TensorDataset(X_tr, y_tr), batch_size=BATCH_SIZE, shuffle=True)
+
+        tp_res = {'ptm': ptm, 'tp': tp_label, 'y_test': y_test, 'n': len(y)}
+
+        t0 = time.time()
+        for name, model in [
+            ("FFN",         FFN(F)),
+            ("CNN",         CNN1D(F)),
+            ("Transformer", TransformerRegressor(F)),
+        ]:
+            preds, r2 = train_model(model, loader, X_te, y_test, EPOCHS, PATIENCE, LR)
+            rmse = np.sqrt(mean_squared_error(y_test, preds))
+            tp_res[f'preds_{name}'] = preds
+            tp_res[f'r2_{name}']    = r2
+            tp_res[f'rmse_{name}']  = rmse
+
+        elapsed       = time.time() - t0
+        total_elapsed = time.time() - total_start
+        remaining     = (total_elapsed / combo_idx) * (total_combos - combo_idx)
+
+        print(
+            f"[{combo_idx:>3}/{total_combos}] {ptm:<14} {tp_label}  "
+            f"FFN=R²{tp_res['r2_FFN']:.3f}/RMSE{tp_res['rmse_FFN']:.3f}  "
+            f"CNN=R²{tp_res['r2_CNN']:.3f}/RMSE{tp_res['rmse_CNN']:.3f}  "
+            f"Trans=R²{tp_res['r2_Transformer']:.3f}/RMSE{tp_res['rmse_Transformer']:.3f}  "
+            f"| {elapsed:.1f}s  (est. {remaining/60:.1f} min left)"
+        )
+
+        csv_rows.append({
+            'PTM':        ptm,
+            'Timepoint':  tp_label,
+            'FFN_R2':     round(tp_res['r2_FFN'],           4),
+            'FFN_RMSE':   round(tp_res['rmse_FFN'],          4),
+            'CNN_R2':     round(tp_res['r2_CNN'],            4),
+            'CNN_RMSE':   round(tp_res['rmse_CNN'],           4),
+            'Trans_R2':   round(tp_res['r2_Transformer'],    4),
+            'Trans_RMSE': round(tp_res['rmse_Transformer'],   4),
+        })
+
+        summary_results[ptm][tp_label] = tp_res
+        all_plot_data.append(tp_res)
+
+# Save CSV
+pd.DataFrame(csv_rows).to_csv(CSV_OUT, index=False)
+print(f"\n✅ Results CSV saved → {CSV_OUT}")
+
+tp_labels      = list(TIMEPOINTS.keys())
+ptms_with_data = [p for p in ptm_list if summary_results.get(p)]
+
+nrows = len(ptms_with_data)
+ncols = len(tp_labels)
+
+colors  = {"FFN": "#2E6DA4", "CNN": "#2E7D32", "Transformer": "#7B1FA2"}
+markers = {"FFN": "o", "CNN": "^", "Transformer": "s"}
+
+fig, axes = plt.subplots(nrows, ncols,
+                         figsize=(ncols * 3.5, nrows * 3.5),
+                         squeeze=False)
+
+fig.suptitle(
+    f"FFN vs CNN vs Transformer — All PTMs × All Timepoints\n"
+    f"Target: +{TARGET_POS}  |  Features: {FEATURE_POSITIONS}",
+    fontsize=14, fontweight='bold', y=1.01
+)
+
+for row_i, ptm in enumerate(ptms_with_data):
+    for col_i, tp_label in enumerate(tp_labels):
+        ax = axes[row_i][col_i]
+
+        if col_i == 0:
+            ax.set_ylabel(f"{ptm}\nPredicted", fontsize=7, fontweight='bold')
+        if row_i == 0:
+            ax.set_title(tp_label, fontsize=9, fontweight='bold')
+
+        if tp_label not in summary_results[ptm]:
+            ax.axis('off')
+            continue
+
+        res    = summary_results[ptm][tp_label]
+        y_test = res['y_test']
+
+        all_vals = np.concatenate(
+            [y_test] + [res[f'preds_{m}'] for m in ["FFN", "CNN", "Transformer"]]
+        )
+        vmin = all_vals.min() - 0.03
+        vmax = all_vals.max() + 0.03
+
+        ax.plot([vmin, vmax], [vmin, vmax], 'k--', lw=0.9, zorder=1)
+
+        for name in ["FFN", "CNN", "Transformer"]:
+            y_pred = res[f'preds_{name}']
+            r2     = res[f'r2_{name}']
+            ax.scatter(y_test, y_pred, alpha=0.15, s=5,
+                       color=colors[name], edgecolors='none',
+                       marker=markers[name], zorder=2)
+            m_fit, b_fit = np.polyfit(y_test, y_pred, 1)
+            x_ln = np.linspace(vmin, vmax, 200)
+            ax.plot(x_ln, m_fit * x_ln + b_fit,
+                    color=colors[name], lw=1.2, alpha=0.9,
+                    label=f"{name} {r2:.2f}", zorder=3)
+
+        ax.set_xlim(vmin, vmax)
+        ax.set_ylim(vmin, vmax)
+        ax.set_aspect('equal', adjustable='box')
+        ax.tick_params(labelsize=6)
+        ax.grid(True, linestyle='--', alpha=0.3)
+        ax.legend(fontsize=5.5, loc='lower right')
+
+        if row_i == nrows - 1:
+            ax.set_xlabel("Observed (+1)", fontsize=7)
+
+plt.tight_layout()
+out_path = '/Users/khusbuagarwal/Downloads/all_ptms_all_tp_FFN_CNN_Transformer_pos1.png'
+plt.savefig(out_path, dpi=120, bbox_inches='tight')
+print(f" Plot saved → {out_path}")
+plt.show()
+
+model_names = ["FFN", "CNN", "Transformer"]
+
+print(f"\n{'PTM':<14} {'TP':<4}", end="")
+for m in model_names:
+    print(f"  {m+' R²':>10} {m+' RMSE':>10}", end="")
+print()
+print("-" * (14 + 4 + len(model_names) * 22))
+
+for ptm in ptms_with_data:
+    for tp_label in tp_labels:
+        if tp_label not in summary_results[ptm]:
+            continue
+        res = summary_results[ptm][tp_label]
+        print(f"{ptm:<14} {tp_label:<4}", end="")
+        for m in model_names:
+            print(f"  {res[f'r2_{m}']:>10.4f} {res[f'rmse_{m}']:>10.4f}", end="")
+        print()
+
+total_mins = (time.time() - total_start) / 60
+print(f"\nTotal time: {total_mins:.1f} minutes")
