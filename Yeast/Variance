@@ -1,0 +1,100 @@
+import pandas as pd
+import numpy as np
+
+df = pd.read_csv('/Users/khusbuagarwal/Downloads/yeast_db.csv')
+
+# Remove first row (timepoints row)
+df = df.iloc[1:].copy()
+
+# Convert numeric columns
+for col in df.columns:
+    df[col] = pd.to_numeric(df[col], errors='coerce')
+
+print(f"Dataset shape: {df.shape}")
+
+meta_cols  = ['nuc_id', 'chr', 'center', 'coverage (RPM)', 'gene', 'acc', 'gene_pos']
+ptm_cols   = [c for c in df.columns
+              if c not in meta_cols and not c.startswith('Input')]
+
+print(f"Total PTM columns (all timepoints): {len(ptm_cols)}")
+
+# Map column names to PTM and timepoint
+# e.g. H2AK5ac = T0, H2AK5ac.1 = T1, ... H2AK5ac.5 = T5
+timepoint_map = {'': 'T0', '.1': 'T1', '.2': 'T2', '.3': 'T3', '.4': 'T4', '.5': 'T5'}
+
+def parse_col(col):
+    for suffix, tp in timepoint_map.items():
+        if suffix == '':
+            # Base name — check it's not .1/.2 etc
+            if '.' not in col:
+                return col, tp
+        else:
+            if col.endswith(suffix):
+                return col[:-len(suffix)], tp
+    return col, 'T0'
+
+ptm_list = sorted(set(parse_col(c)[0] for c in ptm_cols))
+print(f"Unique PTMs: {len(ptm_list)}")
+print(f"PTMs: {ptm_list}\n")
+
+results = []
+
+for col in ptm_cols:
+    ptm, tp = parse_col(col)
+    series  = df[col].dropna()
+
+    if len(series) == 0:
+        continue
+
+    results.append({
+        'PTM':      ptm,
+        'Timepoint': tp,
+        'Column':   col,
+        'N':        len(series),
+        'Min':      round(series.min(),    4),
+        'Max':      round(series.max(),    4),
+        'Mean':     round(series.mean(),   4),
+        'Median':   round(series.median(), 4),
+        'Variance': round(series.var(),    4),
+        'Std':      round(series.std(),    4),
+        'Range':    round(series.max() - series.min(), 4),
+    })
+
+results_df = pd.DataFrame(results).sort_values(['PTM', 'Timepoint'])
+
+print("=== SAMPLE OUTPUT (first 20 rows) ===")
+print(results_df[['PTM','Timepoint','N','Min','Max','Variance','Std']].head(20).to_string(index=False))
+
+summary = results_df.groupby('PTM').agg(
+    N         = ('N',        'mean'),
+    Min       = ('Min',      'min'),
+    Max       = ('Max',      'max'),
+    Mean      = ('Mean',     'mean'),
+    Variance  = ('Variance', 'mean'),
+    Std       = ('Std',      'mean'),
+    Range     = ('Range',    'mean'),
+).round(4).reset_index()
+
+summary = summary.sort_values('Variance', ascending=False)
+
+print("\n=== SUMMARY: Mean stats per PTM (averaged across T0–T5) ===")
+print(f"Sorted by Variance (highest first)\n")
+print(summary.to_string(index=False))
+
+out_path = '/Users/khusbuagarwal/Downloads/yeast_PTM_stats.xlsx'
+
+with pd.ExcelWriter(out_path, engine='openpyxl') as writer:
+
+    # Sheet 1: Per PTM per timepoint
+    results_df[[
+        'PTM', 'Timepoint', 'N',
+        'Min', 'Max', 'Range',
+        'Mean', 'Median', 'Variance', 'Std'
+    ]].to_excel(writer, sheet_name='Per_PTM_Per_Timepoint', index=False)
+
+    # Sheet 2: Summary averaged across timepoints
+    summary.to_excel(writer, sheet_name='Summary_Per_PTM', index=False)
+
+print(f"\n Saved → {out_path}")
+print(f"   Sheet 1 (Per_PTM_Per_Timepoint) : {len(results_df)} rows")
+print(f"   Sheet 2 (Summary_Per_PTM)       : {len(summary)} PTMs")
